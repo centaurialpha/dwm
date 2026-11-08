@@ -199,6 +199,7 @@ static void focusstack(const Arg *arg);
 static Atom getatomprop(Client *c, Atom prop);
 static int getrootptr(int *x, int *y);
 static long getstate(Window w);
+static pid_t getstatusbarpid(void);
 static unsigned int getsystraywidth();
 static int gettextprop(Window w, Atom atom, char *text, unsigned int size);
 static void grabbuttons(Client *c, int focused);
@@ -246,6 +247,7 @@ static void setmfact(const Arg *arg);
 static void setup(void);
 static void seturgent(Client *c, int urg);
 static void showhide(Client *c);
+static void sigstatusbar(const Arg *arg);
 static void spawn(const Arg *arg);
 static Monitor *systraytomon(Monitor *m);
 static void tag(const Arg *arg);
@@ -285,6 +287,9 @@ static Systray *systray = NULL;
 static int refresh_systray_icons = 0;
 static const char broken[] = "broken";
 static char stext[1024];
+static int statusx;           /* x where the status starts, set by drawbar */
+static int statussig;
+static pid_t statuspid = -1;
 static int screen;
 static int sw, sh;           /* X display screen geometry width, height */
 static int bh;               /* bar height */
@@ -483,6 +488,7 @@ buttonpress(XEvent *e)
 	Client *c;
 	Monitor *m;
 	XButtonPressedEvent *ev = &e->xbutton;
+	char *text, *s, ch;
 
 	click = ClkRootWin;
 	/* focus monitor if necessary */
@@ -501,9 +507,41 @@ buttonpress(XEvent *e)
 			arg.ui = 1 << i;
 		} else if (ev->x < x + TEXTW(selmon->ltsymbol))
 			click = ClkLtSymbol;
-		else if (ev->x > selmon->ww - (int)TEXTW(stext) + lrpad - 2 - getsystraywidth())
+		else if (ev->x > statusx) {
+			x = statusx + 1; /* 1px left padding from drawstatusbar */
 			click = ClkStatusText;
-		else
+			statussig = 0;
+			for (text = s = stext; *s && x <= ev->x; s++) {
+				if ((unsigned char)(*s) < ' ') {
+					ch = *s;
+					*s = '\0';
+					x += TEXTW(text) - lrpad;
+					*s = ch;
+					text = s + 1;
+					if (x >= ev->x)
+						break;
+					/* End clickable section on a matching signal raw byte */
+					if (statussig == ch)
+						statussig = 0;
+					else
+						statussig = ch;
+				} else if (*s == '^') {
+					/* skip status2d codes, ^f adds its offset */
+					*s = '\0';
+					x += TEXTW(text) - lrpad;
+					*s = '^';
+					if (x >= ev->x)
+						break;
+					if (*++s == 'f')
+						x += atoi(s + 1);
+					while (*s && *s != '^')
+						s++;
+					if (!*s)
+						break;
+					text = s + 1;
+				}
+			}
+		} else
 			click = ClkWinTitle;
 	} else if ((c = wintoclient(ev->window))) {
 		focus(c);
@@ -844,12 +882,19 @@ drawstatusbar(Monitor *m, int bh, int stw, char* stext) {
 	short isCode = 0;
 	char *text;
 	char *p;
+	char *s, *d;
 
 	len = strlen(stext) + 1 ;
 	if (!(text = (char*) malloc(sizeof(char)*len)))
 		die("malloc");
 	p = text;
 	memcpy(text, stext, len);
+
+	/* drop statuscmd signal bytes, they are not drawn */
+	for (s = d = text; *s; s++)
+		if ((unsigned char)(*s) >= ' ')
+			*d++ = *s;
+	*d = '\0';
 
 	/* compute width of the status text */
 	w = 0;
@@ -963,7 +1008,8 @@ drawbar(Monitor *m)
 
 	/* draw status first so it can be overdrawn by tags later */
 	if (m == selmon) { /* status is only drawn on selected monitor */
-		tw = m->ww - stw - drawstatusbar(m, bh, stw, stext);
+		statusx = drawstatusbar(m, bh, stw, stext);
+		tw = m->ww - stw - statusx;
 	}
 
 	resizebarwin(m);
@@ -1150,6 +1196,30 @@ getsystraywidth()
 	if(showsystray)
 		for(i = systray->icons; i; w += i->w + systrayspacing, i = i->next) ;
 	return w ? w + systrayspacing : 1;
+}
+
+pid_t
+getstatusbarpid(void)
+{
+	char buf[32], *str = buf, *c;
+	FILE *fp;
+
+	if (statuspid > 0) {
+		snprintf(buf, sizeof(buf), "/proc/%u/cmdline", statuspid);
+		if ((fp = fopen(buf, "r"))) {
+			fgets(buf, sizeof(buf), fp);
+			while ((c = strchr(str, '/')))
+				str = c + 1;
+			fclose(fp);
+			if (!strcmp(str, STATUSBAR))
+				return statuspid;
+		}
+	}
+	if (!(fp = popen("pidof -s "STATUSBAR, "r")))
+		return -1;
+	fgets(buf, sizeof(buf), fp);
+	pclose(fp);
+	return strtol(buf, NULL, 10);
 }
 
 int
@@ -2097,6 +2167,20 @@ showhide(Client *c)
 		showhide(c->snext);
 		XMoveWindow(dpy, c->win, WIDTH(c) * -2, c->y);
 	}
+}
+
+void
+sigstatusbar(const Arg *arg)
+{
+	union sigval sv;
+
+	if (!statussig)
+		return;
+	sv.sival_int = arg->i;
+	if ((statuspid = getstatusbarpid()) <= 0)
+		return;
+
+	sigqueue(statuspid, SIGRTMIN+statussig, sv);
 }
 
 void
